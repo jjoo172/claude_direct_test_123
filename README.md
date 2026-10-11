@@ -35,6 +35,14 @@ Every push to `main` redeploys automatically. On the free plan the app sleeps af
 
 Without a token, GitHub allows about 60 scans per hour from the server and only public repos. To raise that and scan private repos, create a [fine-grained personal access token](https://github.com/settings/personal-access-tokens/new) with read-only **Contents** access, then add it as the `GITHUB_TOKEN` environment variable in the Render dashboard.
 
+## Performance
+
+Each rule has a few keywords that must appear on any line it can flag. The scanner finds those keywords across a whole file with a fast substring search and only runs the full rule patterns on matching lines. On CPython (3,500 files, 2.2 million lines) that takes about 1 second on one CPU core, down from 10 seconds when every rule ran on every line, with identical findings. For most repos, downloading the zip from GitHub now takes longer than scanning it.
+
+Scans run as background jobs, and the page shows download and scan progress while it waits.
+
+`SCAN_WORKERS` (default `1`) spreads files across that many processes. Only raise it on a plan with more than one CPU; Render's free plan has a fraction of one core, so extra processes only add overhead there.
+
 ## Limits
 
 - Repos whose zip is over 60 MB are refused.
@@ -43,7 +51,7 @@ Without a token, GitHub allows about 60 scans per hour from the server and only 
 
 ## Files
 
-- `app.py` – Flask routes: `/` (the scanner page), `/api/scan` (POST `{"repo": "owner/repo"}`), `/api/hello`.
+- `app.py` – Flask routes: `/` (the scanner page), `POST /api/scan` (starts a scan, returns a job id), `GET /api/scan/<job>` (progress and results), `/api/hello`.
 - `scanner.py` – downloads the repo and applies the rules. Add or tune rules in the `RULES` list.
 - `templates/index.html` – the page.
 - `render.yaml` – Render deployment config.

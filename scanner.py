@@ -8,6 +8,7 @@ points a human reviewer at code worth reading, and it will have both false
 positives and misses.
 """
 
+import bisect
 import io
 import json
 import os
@@ -187,7 +188,7 @@ def parse_repo(text):
     return m.group(1), m.group(2)
 
 
-def _get(url, accept=None, limit=None):
+def _get(url, accept=None, limit=None, on_bytes=None):
     headers = {"User-Agent": "repo-memory-scanner"}
     if accept:
         headers["Accept"] = accept
@@ -199,10 +200,18 @@ def _get(url, accept=None, limit=None):
         with urllib.request.urlopen(req, timeout=60) as resp:
             if limit is None:
                 return resp.read()
-            data = resp.read(limit + 1)
-            if len(data) > limit:
-                raise ScanError(f"This repository is larger than {limit // (1024 * 1024)} MB, which is the scan limit.")
-            return data
+            chunks, size = [], 0
+            while True:
+                chunk = resp.read(256 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > limit:
+                    raise ScanError(f"This repository is larger than {limit // (1024 * 1024)} MB, which is the scan limit.")
+                chunks.append(chunk)
+                if on_bytes:
+                    on_bytes(size)
+            return b"".join(chunks)
     except urllib.error.HTTPError as e:
         if e.code == 404:
             raise ScanError("Repository not found. Check the name, or note that private repos need a GITHUB_TOKEN on the server.")
@@ -215,12 +224,13 @@ def _get(url, accept=None, limit=None):
         raise ScanError("Couldn't reach GitHub. Try again in a moment.")
 
 
-def fetch_repo(owner, repo):
+def fetch_repo(owner, repo, on_bytes=None):
     meta = json.loads(_get(f"https://api.github.com/repos/{owner}/{repo}", accept="application/vnd.github+json"))
     branch = meta.get("default_branch") or "main"
     if meta.get("size", 0) == 0 and not meta.get("pushed_at"):
         raise ScanError("This repository is empty.")
-    archive = _get(f"https://codeload.github.com/{owner}/{repo}/zip/refs/heads/{branch}", limit=MAX_ARCHIVE_BYTES)
+    archive = _get(f"https://codeload.github.com/{owner}/{repo}/zip/refs/heads/{branch}",
+                   limit=MAX_ARCHIVE_BYTES, on_bytes=on_bytes)
     return branch, archive
 
 
@@ -229,19 +239,112 @@ def _is_comment(line):
     return s.startswith(("//", "/*", "*", "#")) and not s.startswith(("#include", "#define", "#if"))
 
 
-def scan_archive(archive_bytes, owner, repo, branch, include_tests=False):
+# ---------------------------------------------------------------------------
+# Fast path: each rule has keywords that must appear on any line it can
+# match. Each keyword is searched across the whole file in C (a plain
+# substring search, the fastest thing Python's regex engine does), and the
+# full rule patterns then run only on the lines with a hit. Keywords are a
+# loose superset on purpose: an extra hit costs a little time, a missing one
+# would hide a finding.
+# ---------------------------------------------------------------------------
+TRIGGERS = {
+    "c-gets": ["gets"],
+    "c-strcpy": ["cpy"],
+    "c-strcat": ["cat"],
+    "c-sprintf": ["printf"],
+    "c-scanf-s": ["scanf"],
+    "c-format-string": ["printf", "syslog"],
+    "c-memcpy": ["memcpy", "memmove", "CopyMemory", "bcopy"],
+    "c-strncpy": ["cpy", "cat"],
+    "c-alloca": ["alloca"],
+    "c-vla": [re.compile(r"\][ \t]*;")],
+    "c-realloc-self": ["realloc"],
+    "c-malloc-mul": ["malloc"],
+    "c-free": ["free"],
+    "cpp-reinterpret": ["reinterpret_cast"],
+    "rs-unsafe": ["unsafe"],
+    "rs-transmute": ["transmute"],
+    "rs-raw-parts": ["from_raw_parts"],
+    "rs-unchecked": ["_unchecked", "set_len"],
+    "go-unsafe": ["unsafe."],
+    "go-cgo": ['"C"'],
+    "cs-unsafe": ["unsafe", "stackalloc", "fixed"],
+    "cs-marshal": ["Marshal."],
+    "py-ctypes": ["ctypes."],
+    "zig-ptrcast": ["@ptrCast", "@intToPtr", "@ptrFromInt", "@alignCast"],
+}
+assert set(TRIGGERS) == {r.id for r in RULES}, "every rule needs a trigger"
+
+_LANG_PLAN = {}  # lang -> ([trigger regexes], [rules])
+_NL = re.compile("\n")
+
+
+def _plan(lang):
+    if lang not in _LANG_PLAN:
+        rules = [r for r in RULES if lang in r.languages]
+        trigs = {}
+        for r in rules:
+            for t in TRIGGERS[r.id]:
+                pat = t if isinstance(t, re.Pattern) else re.compile(re.escape(t))
+                trigs[pat.pattern] = pat
+        _LANG_PLAN[lang] = (list(trigs.values()), rules)
+    return _LANG_PLAN[lang]
+
+
+def scan_file(path, lang, text, owner, repo, branch):
+    """Scan one file's text. Returns (line_count, findings)."""
+    lines = text.split("\n")
+    trigs, rules = _plan(lang)
+    if not rules:
+        return len(lines), []
+
+    # Map trigger hits to line indexes via a sorted list of newline offsets.
+    hits = sorted({m.start() for t in trigs for m in t.finditer(text)})
+    if not hits:
+        return len(lines), []
+    newlines = [m.start() for m in _NL.finditer(text)]
+    candidates = {bisect.bisect_left(newlines, pos) for pos in hits}
+
     findings = []
-    files_scanned = 0
-    lines_scanned = 0
-    total_bytes = 0
-    lang_counts = {}
-    truncated = False
+    for i in sorted(candidates):
+        line = lines[i].rstrip("\r")
+        if len(line) > 1000 or _is_comment(line):
+            continue
+        for rule in rules:
+            if rule.pattern.search(line):
+                start = max(0, i - CONTEXT_LINES)
+                end = min(len(lines), i + CONTEXT_LINES + 1)
+                findings.append({
+                    "rule": rule.id,
+                    "severity": rule.severity,
+                    "title": rule.title,
+                    "why": rule.why,
+                    "instead": rule.instead,
+                    "language": lang,
+                    "path": path,
+                    "line": i + 1,
+                    "snippet": [{"n": n + 1, "text": lines[n].rstrip("\r")[:300]} for n in range(start, end)],
+                    "url": f"https://github.com/{owner}/{repo}/blob/{branch}/{path}#L{i + 1}",
+                })
+    return len(lines), findings
 
+
+def _scan_batch(batch, owner, repo, branch):
+    """Worker entry point for a process pool: scan several files."""
+    return [(path, lang) + scan_file(path, lang, text, owner, repo, branch) for path, lang, text in batch]
+
+
+def _worker_count():
     try:
-        zf = zipfile.ZipFile(io.BytesIO(archive_bytes))
-    except zipfile.BadZipFile:
-        raise ScanError("GitHub returned an archive that couldn't be read.")
+        return max(1, int(os.environ.get("SCAN_WORKERS", "1")))
+    except ValueError:
+        return 1
 
+
+def list_source_files(zf, include_tests=False):
+    """Pick the scannable files out of a repo archive."""
+    skip = SKIP_DIRS if not include_tests else SKIP_DIRS - {"test", "tests"}
+    picked, total_bytes, truncated = [], 0, False
     for info in zf.infolist():
         if info.is_dir() or info.file_size > MAX_FILE_BYTES:
             continue
@@ -250,54 +353,65 @@ def scan_archive(archive_bytes, owner, repo, branch, include_tests=False):
         if len(parts) < 2:
             continue
         path = parts[1]
-        dirs = {d.lower() for d in path.split("/")[:-1]}
-        skip = SKIP_DIRS if not include_tests else SKIP_DIRS - {"test", "tests"}
-        if dirs & skip:
+        if {d.lower() for d in path.split("/")[:-1]} & skip:
             continue
-        ext = os.path.splitext(path)[1].lower()
-        lang = LANG_BY_EXT.get(ext)
+        lang = LANG_BY_EXT.get(os.path.splitext(path)[1].lower())
         if not lang:
             continue
         total_bytes += info.file_size
         if total_bytes > MAX_TOTAL_SCANNED_BYTES:
             truncated = True
             break
+        picked.append((info, path, lang))
+    return picked, truncated
 
-        text = zf.read(info).decode("utf-8", errors="replace")
-        lines = text.splitlines()
-        files_scanned += 1
-        lines_scanned += len(lines)
-        lang_counts[lang] = lang_counts.get(lang, 0) + 1
-        rules = [r for r in RULES if lang in r.languages]
 
-        for i, line in enumerate(lines):
-            if len(line) > 1000 or _is_comment(line):
-                continue
-            for rule in rules:
-                if rule.pattern.search(line):
-                    start = max(0, i - CONTEXT_LINES)
-                    end = min(len(lines), i + CONTEXT_LINES + 1)
-                    findings.append({
-                        "rule": rule.id,
-                        "severity": rule.severity,
-                        "title": rule.title,
-                        "why": rule.why,
-                        "instead": rule.instead,
-                        "language": lang,
-                        "path": path,
-                        "line": i + 1,
-                        "snippet": [{"n": n + 1, "text": lines[n][:300]} for n in range(start, end)],
-                        "url": f"https://github.com/{owner}/{repo}/blob/{branch}/{path}#L{i + 1}",
-                    })
-                    if len(findings) >= MAX_FINDINGS:
-                        truncated = True
-                        break
-            if truncated:
-                break
-        if truncated:
-            break
+def scan_archive(archive_bytes, owner, repo, branch, include_tests=False, progress=None, workers=None):
+    """Scan a zip archive. progress(done, total) is called as files finish."""
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(archive_bytes))
+    except zipfile.BadZipFile:
+        raise ScanError("GitHub returned an archive that couldn't be read.")
+
+    files, truncated = list_source_files(zf, include_tests)
+    total = len(files)
+    workers = workers or _worker_count()
+    findings, lines_scanned, lang_counts, done = [], 0, {}, 0
+    if progress:
+        progress(0, total)
+
+    def read(item):
+        info, path, lang = item
+        return path, lang, zf.read(info).decode("utf-8", errors="replace")
+
+    def collect(results):
+        nonlocal lines_scanned, done
+        for path, lang, n_lines, found in results:
+            lines_scanned += n_lines
+            lang_counts[lang] = lang_counts.get(lang, 0) + 1
+            findings.extend(found)
+            done += 1
+        if progress:
+            progress(done, total)
+
+    if workers <= 1 or total < 200:
+        for k in range(0, total, 50):
+            collect(_scan_batch([read(f) for f in files[k:k + 50]], owner, repo, branch))
+    else:
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+        batch_size = max(20, min(200, total // (workers * 8) or 1))
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            futures = [
+                pool.submit(_scan_batch, [read(f) for f in files[k:k + batch_size]], owner, repo, branch)
+                for k in range(0, total, batch_size)
+            ]
+            for fut in as_completed(futures):
+                collect(fut.result())
 
     findings.sort(key=lambda f: (SEVERITY_ORDER[f["severity"]], f["path"], f["line"]))
+    if len(findings) > MAX_FINDINGS:
+        findings = findings[:MAX_FINDINGS]   # keeps the most severe, since it's sorted
+        truncated = True
     counts = {s: 0 for s in SEVERITY_ORDER}
     for f in findings:
         counts[f["severity"]] += 1
@@ -305,7 +419,7 @@ def scan_archive(archive_bytes, owner, repo, branch, include_tests=False):
     return {
         "repo": f"{owner}/{repo}",
         "branch": branch,
-        "files_scanned": files_scanned,
+        "files_scanned": done,
         "lines_scanned": lines_scanned,
         "languages": lang_counts,
         "counts": counts,
@@ -314,7 +428,12 @@ def scan_archive(archive_bytes, owner, repo, branch, include_tests=False):
     }
 
 
-def scan(repo_text, include_tests=False):
+def scan(repo_text, include_tests=False, report=None):
+    """Download and scan a repo. report(**fields) receives progress updates."""
+    report = report or (lambda **kw: None)
     owner, repo = parse_repo(repo_text)
-    branch, archive = fetch_repo(owner, repo)
-    return scan_archive(archive, owner, repo, branch, include_tests=include_tests)
+    report(phase="downloading", bytes=0)
+    branch, archive = fetch_repo(owner, repo, on_bytes=lambda n: report(bytes=n))
+    report(phase="scanning", done=0, total=0)
+    return scan_archive(archive, owner, repo, branch, include_tests=include_tests,
+                        progress=lambda d, t: report(done=d, total=t))
