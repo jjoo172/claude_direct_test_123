@@ -1,42 +1,30 @@
 import os
 
-from flask import Flask, jsonify
+from flask import Flask, jsonify, render_template, request
+
+import scanner
 
 app = Flask(__name__)
-
-PAGE = """<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Hello World</title>
-  <style>
-    body { margin: 0; min-height: 100vh; display: grid; place-items: center;
-           font-family: system-ui, sans-serif; background: #f6f6f4; color: #222; }
-    @media (prefers-color-scheme: dark) { body { background: #181818; color: #eee; } }
-    h1 { font-size: clamp(2rem, 8vw, 4rem); margin: 0; }
-  </style>
-</head>
-<body>
-  <h1 id="msg">Loading…</h1>
-  <script>
-    fetch("/api/hello")
-      .then(r => r.json())
-      .then(d => { document.getElementById("msg").textContent = d.message; })
-      .catch(() => { document.getElementById("msg").textContent = "Backend unreachable"; });
-  </script>
-</body>
-</html>"""
 
 
 @app.get("/")
 def index():
-    return PAGE
+    return render_template("index.html")
 
 
 @app.get("/api/hello")
 def hello():
     return jsonify(message="Hello, World!")
+
+
+@app.post("/api/scan")
+def scan():
+    body = request.get_json(silent=True) or {}
+    try:
+        result = scanner.scan(body.get("repo", ""), include_tests=bool(body.get("include_tests")))
+    except scanner.ScanError as e:
+        return jsonify(error=str(e)), 400
+    return jsonify(result)
 
 
 if __name__ == "__main__":

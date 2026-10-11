@@ -1,0 +1,260 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Repo Memory Scan</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --paper: #E9EDF1;
+    --panel: #FFFFFF;
+    --ink: #17202B;
+    --muted: #556270;
+    --rule: #C9D1DA;
+    --action: #234E8C;
+    --action-ink: #FFFFFF;
+    --code-bg: #F4F6F8;
+    --hit-bg: #FFF2D6;
+    --critical: #9B1C1C;
+    --high: #C2410C;
+    --medium: #A16207;
+    --low: #4F6B85;
+    --sans: "Instrument Sans", system-ui, sans-serif;
+    --mono: "JetBrains Mono", ui-monospace, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper: #12171D;
+      --panel: #1A2129;
+      --ink: #E4E9EE;
+      --muted: #96A3B0;
+      --rule: #2C3640;
+      --action: #6F9BE0;
+      --action-ink: #0E1620;
+      --code-bg: #141A20;
+      --hit-bg: #3A2E14;
+      --critical: #F07171;
+      --high: #F59152;
+      --medium: #E1B44A;
+      --low: #8EAAC6;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--paper); color: var(--ink); font: 400 16px/1.55 var(--sans); }
+  main { max-width: 1000px; margin: 0 auto; padding: 56px 16px 96px; }
+  a { color: var(--action); }
+  :focus-visible { outline: 3px solid var(--action); outline-offset: 2px; }
+
+  h1 { font-size: clamp(1.9rem, 5vw, 2.75rem); line-height: 1.1; font-weight: 700; letter-spacing: -0.02em; margin: 0 0 12px; }
+  .lede { color: var(--muted); max-width: 62ch; margin: 0 0 32px; }
+
+  form { display: grid; grid-template-columns: 1fr auto; gap: 10px; }
+  input[type=text] {
+    font: 500 1.05rem var(--mono); padding: 14px 16px; border: 2px solid var(--rule);
+    border-radius: 6px; background: var(--panel); color: var(--ink); min-width: 0;
+  }
+  input[type=text]:focus { border-color: var(--action); outline: none; }
+  button.go {
+    font: 600 1rem var(--sans); padding: 0 24px; border: 0; border-radius: 6px;
+    background: var(--action); color: var(--action-ink); cursor: pointer;
+  }
+  button.go:disabled { opacity: .6; cursor: progress; }
+  .opts { grid-column: 1 / -1; color: var(--muted); font-size: .92rem; display: flex; gap: 8px; align-items: center; }
+
+  .status { margin-top: 28px; color: var(--muted); }
+  .error { margin-top: 28px; padding: 14px 16px; border-left: 4px solid var(--critical); background: var(--panel); }
+
+  /* Spectrum: the distribution of findings, also the filter */
+  .summary { margin-top: 40px; }
+  .summary h2 { font-size: 1.35rem; margin: 0 0 4px; }
+  .meta { color: var(--muted); font-size: .92rem; margin: 0 0 18px; }
+  .spectrum { display: flex; height: 44px; border-radius: 6px; overflow: hidden; background: var(--rule); }
+  .spectrum button {
+    border: 0; padding: 0; cursor: pointer; min-width: 4px; position: relative;
+    transition: opacity .15s;
+  }
+  .spectrum button[aria-pressed=false] { opacity: .25; }
+  .legend { display: flex; flex-wrap: wrap; gap: 8px 22px; margin-top: 12px; }
+  .legend button {
+    font: 500 .95rem var(--sans); color: var(--ink); background: none; border: 0; padding: 4px 0;
+    display: flex; align-items: center; gap: 8px; cursor: pointer;
+  }
+  .legend button[aria-pressed=false] { color: var(--muted); text-decoration: line-through; }
+  .swatch { width: 12px; height: 12px; border-radius: 3px; }
+  .legend b { font-variant-numeric: tabular-nums; }
+  .clean { margin-top: 18px; padding: 18px; background: var(--panel); border-radius: 6px; }
+
+  /* Findings */
+  .file { margin-top: 36px; }
+  .file h3 { font: 600 .98rem var(--mono); margin: 0 0 10px; word-break: break-all; }
+  .file h3 span { font-family: var(--sans); font-weight: 400; color: var(--muted); }
+  .finding {
+    background: var(--panel); border-radius: 6px; margin-bottom: 10px;
+    border-left: 5px solid var(--sev); padding: 16px 18px 14px;
+  }
+  .f-head { display: flex; flex-wrap: wrap; gap: 4px 14px; align-items: baseline; }
+  .f-head strong { font-weight: 600; }
+  .sev { font-size: .85rem; font-weight: 600; color: var(--sev); }
+  .f-head a { margin-left: auto; font: 400 .88rem var(--mono); }
+  pre {
+    margin: 12px 0; padding: 8px 0; background: var(--code-bg); border-radius: 4px;
+    font: 400 .84rem/1.6 var(--mono); overflow-x: auto;
+  }
+  pre div { padding: 0 14px; white-space: pre; }
+  pre div.hit { background: var(--hit-bg); }
+  pre .n { display: inline-block; width: 5ch; color: var(--muted); user-select: none; }
+  .why { margin: 0; color: var(--ink); max-width: 75ch; }
+  .instead { margin: 6px 0 0; color: var(--muted); font-size: .94rem; }
+  .instead code { font-family: var(--mono); font-size: .88em; color: var(--ink); }
+  .more { margin-top: 28px; }
+  .more button { font: 600 .95rem var(--sans); background: none; border: 2px solid var(--rule); color: var(--ink); padding: 10px 18px; border-radius: 6px; cursor: pointer; }
+  .note { margin-top: 56px; color: var(--muted); font-size: .9rem; max-width: 70ch; }
+
+  @media (max-width: 560px) {
+    form { grid-template-columns: 1fr; }
+    button.go { padding: 14px; }
+    .f-head a { margin-left: 0; }
+  }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+</head>
+<body>
+<main>
+  <h1>Check a GitHub repo for memory-unsafe code</h1>
+  <p class="lede">Paste a repository and get a list of the spots worth reviewing before you depend on it: unbounded copies, unchecked buffers, format strings, and unsafe blocks in C, C++, Rust, Go, C#, Zig, and Python's ctypes.</p>
+
+  <form id="form">
+    <input id="repo" type="text" autocomplete="off" spellcheck="false"
+           placeholder="https://github.com/owner/repo" aria-label="GitHub repository URL" required>
+    <button class="go" id="go" type="submit">Scan repo</button>
+    <label class="opts"><input type="checkbox" id="tests"> Include test folders</label>
+  </form>
+
+  <div id="out" aria-live="polite"></div>
+
+  <p class="note">This scanner matches known risky patterns line by line. It doesn't compile or trace the code, so some findings will be safe in context and some real bugs won't show up. Treat it as a reading list for review, not a verdict. Vendored and third_party folders are skipped.</p>
+</main>
+
+<script>
+const SEVS = ["critical", "high", "medium", "low"];
+const LABEL = { critical: "Critical", high: "High", medium: "Medium", low: "Low" };
+const PAGE = 150;
+let data = null, active = new Set(SEVS), shown = PAGE;
+
+const $ = (s) => document.querySelector(s);
+const el = (tag, props = {}, ...kids) => {
+  const n = document.createElement(tag);
+  for (const [k, v] of Object.entries(props)) {
+    if (k === "style") n.setAttribute("style", v);
+    else if (k in n) n[k] = v; else n.setAttribute(k, v);
+  }
+  for (const k of kids) if (k != null) n.append(k);
+  return n;
+};
+const sevColor = (s) => `var(--${s})`;
+
+$("#form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const repo = $("#repo").value.trim();
+  const out = $("#out");
+  $("#go").disabled = true; $("#go").textContent = "Scanning…";
+  out.replaceChildren(el("p", { className: "status", textContent: `Downloading and scanning ${repo}. Large repos can take a minute.` }));
+  try {
+    const r = await fetch("/api/scan", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ repo, include_tests: $("#tests").checked }),
+    });
+    const body = await r.json().catch(() => ({ error: "The server sent back something unexpected." }));
+    if (!r.ok || body.error) throw new Error(body.error || `Scan failed (${r.status}).`);
+    data = body; active = new Set(SEVS); shown = PAGE;
+    render();
+  } catch (err) {
+    out.replaceChildren(el("div", { className: "error", textContent: err.message }));
+  } finally {
+    $("#go").disabled = false; $("#go").textContent = "Scan repo";
+  }
+});
+
+function toggle(sev) {
+  if (active.has(sev) && active.size === 1) active = new Set(SEVS);
+  else if (active.size === SEVS.length) active = new Set([sev]);
+  else active.has(sev) ? active.delete(sev) : active.add(sev);
+  shown = PAGE;
+  render();
+}
+
+function render() {
+  const out = $("#out");
+  const total = data.findings.length;
+  const langs = Object.entries(data.languages).map(([l, n]) => `${n} ${l}`).join(", ") || "no supported source files";
+  const summary = el("section", { className: "summary" },
+    el("h2", { textContent: total ? `${total.toLocaleString()} spots to review in ${data.repo}` : `Nothing flagged in ${data.repo}` }),
+    el("p", { className: "meta", textContent:
+      `Branch ${data.branch}. Scanned ${data.files_scanned.toLocaleString()} files (${langs}), ${data.lines_scanned.toLocaleString()} lines.` +
+      (data.truncated ? " The scan stopped early because the repo hit a size or findings limit." : "") }),
+  );
+
+  if (!total) {
+    summary.append(el("div", { className: "clean", textContent: data.files_scanned
+      ? "None of the patterns matched. That lowers the risk but doesn't rule out memory bugs; a fuzzer or sanitizer build goes further."
+      : "This repo has no source files in the languages the scanner covers." }));
+    out.replaceChildren(summary);
+    return;
+  }
+
+  const bar = el("div", { className: "spectrum", role: "group", "aria-label": "Filter by severity" });
+  const legend = el("div", { className: "legend" });
+  for (const s of SEVS) {
+    const n = data.counts[s];
+    if (!n) continue;
+    const pressed = String(active.has(s));
+    bar.append(el("button", { type: "button", title: `${LABEL[s]}: ${n}`, "aria-label": `${LABEL[s]}, ${n} findings`,
+      "aria-pressed": pressed, style: `flex:${n} 1 0;background:${sevColor(s)}`, onclick: () => toggle(s) }));
+    legend.append(el("button", { type: "button", "aria-pressed": pressed, onclick: () => toggle(s) },
+      el("span", { className: "swatch", style: `background:${sevColor(s)}` }),
+      `${LABEL[s]} `, el("b", { textContent: n.toLocaleString() })));
+  }
+  summary.append(bar, legend);
+
+  const visible = data.findings.filter((f) => active.has(f.severity));
+  const list = el("section");
+  let currentPath = null, group = null;
+  const fileCounts = {};
+  for (const f of visible) fileCounts[f.path] = (fileCounts[f.path] || 0) + 1;
+
+  for (const f of visible.slice(0, shown)) {
+    if (f.path !== currentPath) {
+      currentPath = f.path;
+      group = el("div", { className: "file" },
+        el("h3", {}, f.path, el("span", { textContent: `  ${fileCounts[f.path]} ${fileCounts[f.path] === 1 ? "finding" : "findings"}` })));
+      list.append(group);
+    }
+    const pre = el("pre");
+    for (const ln of f.snippet) {
+      pre.append(el("div", { className: ln.n === f.line ? "hit" : "" },
+        el("span", { className: "n", textContent: ln.n }), ln.text));
+    }
+    group.append(el("article", { className: "finding", style: `--sev:${sevColor(f.severity)}` },
+      el("div", { className: "f-head" },
+        el("span", { className: "sev", textContent: LABEL[f.severity] }),
+        el("strong", { textContent: f.title }),
+        el("a", { href: f.url, target: "_blank", rel: "noopener", textContent: `Line ${f.line} on GitHub` })),
+      pre,
+      el("p", { className: "why", textContent: f.why }),
+      el("p", { className: "instead" }, "Use instead: ", el("code", { textContent: f.instead }))));
+  }
+
+  const nodes = [summary, list];
+  if (visible.length > shown) {
+    nodes.push(el("div", { className: "more" },
+      el("button", { type: "button", textContent: `Show ${Math.min(PAGE, visible.length - shown)} more of ${visible.length - shown} remaining`,
+        onclick: () => { shown += PAGE; render(); } })));
+  }
+  out.replaceChildren(...nodes);
+}
+</script>
+</body>
+</html>
