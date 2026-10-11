@@ -114,6 +114,18 @@
   .why { margin: 0; color: var(--ink); max-width: 75ch; }
   .instead { margin: 6px 0 0; color: var(--muted); font-size: .94rem; }
   .instead code { font-family: var(--mono); font-size: .88em; color: var(--ink); }
+  :root { --del-bg: #FBE4E4; --add-bg: #DFF3E4; --del-ink: #8A1C1C; --add-ink: #1D5E31; }
+  @media (prefers-color-scheme: dark) { :root { --del-bg: #3A1E20; --add-bg: #17331F; --del-ink: #F4A3A3; --add-ink: #93D9A6; } }
+  .patch { margin-top: 14px; border: 1px solid var(--rule); border-radius: 6px; overflow: hidden; }
+  .patch-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; padding: 8px 12px; background: var(--code-bg); border-bottom: 1px solid var(--rule); }
+  .patch-head strong { font-size: .92rem; }
+  .patch-head .todo { font-size: .85rem; color: var(--medium); font-weight: 600; }
+  .patch-head button { margin-left: auto; font: 600 .85rem var(--sans); background: var(--panel); color: var(--ink); border: 1px solid var(--rule); border-radius: 4px; padding: 4px 10px; cursor: pointer; }
+  .patch pre { margin: 0; border-radius: 0; background: var(--panel); }
+  .patch pre div.del { background: var(--del-bg); color: var(--del-ink); }
+  .patch pre div.add { background: var(--add-bg); color: var(--add-ink); }
+  .patch pre .sign { display: inline-block; width: 2ch; user-select: none; }
+  .patch .note { margin: 0; padding: 10px 12px; font-size: .92rem; color: var(--muted); border-top: 1px solid var(--rule); }
   .more { margin-top: 28px; }
   .more button { font: 600 .95rem var(--sans); background: none; border: 2px solid var(--rule); color: var(--ink); padding: 10px 18px; border-radius: 6px; cursor: pointer; }
   .note { margin-top: 56px; color: var(--muted); font-size: .9rem; max-width: 70ch; }
@@ -212,6 +224,36 @@ function toggle(sev) {
   render();
 }
 
+function unifiedDiff(f) {
+  // Surrounding lines from the snippet are included as context so the diff
+  // applies cleanly with `git apply` or `patch -p1`.
+  const pre = f.snippet.filter((s) => s.n < f.line), post = f.snippet.filter((s) => s.n > f.line);
+  const start = pre.length ? pre[0].n : f.line;
+  const oldLen = pre.length + 1 + post.length, newLen = pre.length + f.fix.after.length + post.length;
+  return [`--- a/${f.path}`, `+++ b/${f.path}`, `@@ -${start},${oldLen} +${start},${newLen} @@`,
+          ...pre.map((s) => ` ${s.text}`), `-${f.fix.before}`, ...f.fix.after.map((l) => `+${l}`),
+          ...post.map((s) => ` ${s.text}`)].join("\n") + "\n";
+}
+
+function patchView(f) {
+  const copy = el("button", { type: "button", textContent: "Copy diff" });
+  copy.onclick = async () => {
+    try { await navigator.clipboard.writeText(unifiedDiff(f)); copy.textContent = "Copied"; }
+    catch { copy.textContent = "Copy failed"; }
+    setTimeout(() => { copy.textContent = "Copy diff"; }, 1600);
+  };
+  const pre = el("pre");
+  pre.append(el("div", { className: "del" }, el("span", { className: "sign", textContent: "-" }), f.fix.before));
+  for (const l of f.fix.after) pre.append(el("div", { className: "add" }, el("span", { className: "sign", textContent: "+" }), l));
+  return el("div", { className: "patch" },
+    el("div", { className: "patch-head" },
+      el("strong", { textContent: "Suggested patch" }),
+      f.fix.confirmed ? null : el("span", { className: "todo", textContent: "Needs the buffer size filled in" }),
+      copy),
+    pre,
+    el("p", { className: "note", textContent: f.fix.note }));
+}
+
 function render() {
   const out = $("#out");
   const total = data.findings.length;
@@ -271,7 +313,7 @@ function render() {
         el("a", { href: f.url, target: "_blank", rel: "noopener", textContent: `Line ${f.line} on GitHub` })),
       pre,
       el("p", { className: "why", textContent: f.why }),
-      el("p", { className: "instead" }, "Use instead: ", el("code", { textContent: f.instead }))));
+      f.fix ? patchView(f) : el("p", { className: "instead" }, "Use instead: ", el("code", { textContent: f.instead }))));
   }
 
   const nodes = [summary, list];

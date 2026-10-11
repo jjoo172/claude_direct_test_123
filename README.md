@@ -17,6 +17,12 @@ Paste a repo URL (or `owner/repo`) on the home page and click **Scan repo**.
 
 Findings are ranked critical, high, medium, or low. Click the colored bar or the legend to filter by severity.
 
+### Suggested patches
+
+Critical and high findings in C and C++ come with a suggested patch when the fix is mechanical: `gets` → `fgets`, `strcpy` → `snprintf`, `strcat` → `strncat` with the remaining space, `sprintf`/`vsprintf` → `snprintf`/`vsnprintf`, a literal `"%s"` for variable format strings, and field widths for `scanf("%s")`. **Copy diff** gives a unified diff that applies with `git apply` or `patch -p1`.
+
+Bounded calls need the buffer's size. A patch uses `sizeof(buf)` only when `buf` is declared as an array earlier in the same file; for pointers and array parameters (where `sizeof` gives the pointer size) it writes a `<size of buf>` placeholder that won't compile until you fill in the real size. Those patches are marked **Needs the buffer size filled in**. Calls that span several lines or whose return value is used are left without a patch. The fixes change overflow into truncation, so check that truncated data is handled sensibly.
+
 This is a pattern scanner: it reads code line by line and doesn't compile or trace it, so some findings are safe in context and some real bugs won't be caught. Use it as a review list. Folders named `vendor`, `third_party`, `external`, `deps`, and `node_modules` are skipped, and so are `test`/`tests` unless you tick **Include test folders**.
 
 The repo is downloaded as a zip and read in memory only; nothing from it is written to disk or run.
@@ -53,6 +59,7 @@ Scans run as background jobs, and the page shows download and scan progress whil
 
 - `app.py` – Flask routes: `/` (the scanner page), `POST /api/scan` (starts a scan, returns a job id), `GET /api/scan/<job>` (progress and results), `/api/hello`.
 - `scanner.py` – downloads the repo and applies the rules. Add or tune rules in the `RULES` list.
+- `fixes.py` – builds suggested patches for critical and high C/C++ findings.
 - `templates/index.html` – the page.
 - `render.yaml` – Render deployment config.
 

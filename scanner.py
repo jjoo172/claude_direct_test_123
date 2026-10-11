@@ -18,6 +18,8 @@ import urllib.request
 import zipfile
 from dataclasses import dataclass
 
+import fixes
+
 MAX_ARCHIVE_BYTES = 60 * 1024 * 1024    # refuse repos whose zip is bigger than this
 MAX_FILE_BYTES = 1024 * 1024            # skip individual source files bigger than this
 MAX_TOTAL_SCANNED_BYTES = 150 * 1024 * 1024
@@ -325,6 +327,7 @@ def scan_file(path, lang, text, owner, repo, branch):
                     "line": i + 1,
                     "snippet": [{"n": n + 1, "text": lines[n].rstrip("\r")[:300]} for n in range(start, end)],
                     "url": f"https://github.com/{owner}/{repo}/blob/{branch}/{path}#L{i + 1}",
+                    "fix": fixes.suggest(rule.id, lang, lines, i) if rule.severity in ("critical", "high") else None,
                 })
     return len(lines), findings
 
