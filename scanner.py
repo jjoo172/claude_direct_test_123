@@ -202,6 +202,12 @@ def _get(url, accept=None, limit=None, on_bytes=None):
         with urllib.request.urlopen(req, timeout=60) as resp:
             if limit is None:
                 return resp.read()
+            try:
+                length = int(resp.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = 0
+            if on_bytes:
+                on_bytes(0, length)
             chunks, size = [], 0
             while True:
                 chunk = resp.read(256 * 1024)
@@ -212,7 +218,7 @@ def _get(url, accept=None, limit=None, on_bytes=None):
                     raise ScanError(f"This repository is larger than {limit // (1024 * 1024)} MB, which is the scan limit.")
                 chunks.append(chunk)
                 if on_bytes:
-                    on_bytes(size)
+                    on_bytes(size, length)
             return b"".join(chunks)
     except urllib.error.HTTPError as e:
         if e.code == 404:
@@ -226,11 +232,27 @@ def _get(url, accept=None, limit=None, on_bytes=None):
         raise ScanError("Couldn't reach GitHub. Try again in a moment.")
 
 
-def fetch_repo(owner, repo, on_bytes=None):
+def fetch_repo(owner, repo, report=None):
+    report = report or (lambda **kw: None)
+    report(phase="looking_up")
     meta = json.loads(_get(f"https://api.github.com/repos/{owner}/{repo}", accept="application/vnd.github+json"))
     branch = meta.get("default_branch") or "main"
     if meta.get("size", 0) == 0 and not meta.get("pushed_at"):
         raise ScanError("This repository is empty.")
+
+    # GitHub usually streams the zip without a Content-Length, so fall back to
+    # the repo's reported size (KB, including history) as a rough estimate.
+    # The page treats an estimate as "about" and never lets the bar reach the
+    # end of the download step on an estimate alone.
+    guess = min(int(meta.get("size") or 0) * 1024, MAX_ARCHIVE_BYTES)
+    report(phase="downloading", bytes=0, expected=guess, exact=False)
+
+    def on_bytes(n, length):
+        if length:
+            report(bytes=n, expected=length, exact=True)
+        else:
+            report(bytes=n)
+
     archive = _get(f"https://codeload.github.com/{owner}/{repo}/zip/refs/heads/{branch}",
                    limit=MAX_ARCHIVE_BYTES, on_bytes=on_bytes)
     return branch, archive
@@ -369,8 +391,10 @@ def list_source_files(zf, include_tests=False):
     return picked, truncated
 
 
-def scan_archive(archive_bytes, owner, repo, branch, include_tests=False, progress=None, workers=None):
-    """Scan a zip archive. progress(done, total) is called as files finish."""
+def scan_archive(archive_bytes, owner, repo, branch, include_tests=False, progress=None, workers=None,
+                 on_finishing=None):
+    """Scan a zip archive. progress(done, total, last_path) is called as files
+    finish; on_finishing(n_findings) when scanning ends and results are built."""
     try:
         zf = zipfile.ZipFile(io.BytesIO(archive_bytes))
     except zipfile.BadZipFile:
@@ -381,7 +405,7 @@ def scan_archive(archive_bytes, owner, repo, branch, include_tests=False, progre
     workers = workers or _worker_count()
     findings, lines_scanned, lang_counts, done = [], 0, {}, 0
     if progress:
-        progress(0, total)
+        progress(0, total, None)
 
     def read(item):
         info, path, lang = item
@@ -389,13 +413,14 @@ def scan_archive(archive_bytes, owner, repo, branch, include_tests=False, progre
 
     def collect(results):
         nonlocal lines_scanned, done
+        path = None
         for path, lang, n_lines, found in results:
             lines_scanned += n_lines
             lang_counts[lang] = lang_counts.get(lang, 0) + 1
             findings.extend(found)
             done += 1
         if progress:
-            progress(done, total)
+            progress(done, total, path)
 
     if workers <= 1 or total < 200:
         for k in range(0, total, 50):
@@ -411,6 +436,8 @@ def scan_archive(archive_bytes, owner, repo, branch, include_tests=False, progre
             for fut in as_completed(futures):
                 collect(fut.result())
 
+    if on_finishing:
+        on_finishing(len(findings))
     findings.sort(key=lambda f: (SEVERITY_ORDER[f["severity"]], f["path"], f["line"]))
     if len(findings) > MAX_FINDINGS:
         findings = findings[:MAX_FINDINGS]   # keeps the most severe, since it's sorted
@@ -435,8 +462,10 @@ def scan(repo_text, include_tests=False, report=None):
     """Download and scan a repo. report(**fields) receives progress updates."""
     report = report or (lambda **kw: None)
     owner, repo = parse_repo(repo_text)
-    report(phase="downloading", bytes=0)
-    branch, archive = fetch_repo(owner, repo, on_bytes=lambda n: report(bytes=n))
-    report(phase="scanning", done=0, total=0)
-    return scan_archive(archive, owner, repo, branch, include_tests=include_tests,
-                        progress=lambda d, t: report(done=d, total=t))
+    branch, archive = fetch_repo(owner, repo, report=report)
+    report(phase="unpacking", bytes=len(archive))
+    return scan_archive(
+        archive, owner, repo, branch, include_tests=include_tests,
+        progress=lambda d, t, path: report(phase="scanning", done=d, total=t, current=path),
+        on_finishing=lambda n: report(phase="finishing", findings=n),
+    )

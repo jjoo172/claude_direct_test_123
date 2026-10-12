@@ -45,7 +45,7 @@ Without a token, GitHub allows about 60 scans per hour from the server and only 
 
 Each rule has a few keywords that must appear on any line it can flag. The scanner finds those keywords across a whole file with a fast substring search and only runs the full rule patterns on matching lines. On CPython (3,500 files, 2.2 million lines) that takes about 1 second on one CPU core, down from 10 seconds when every rule ran on every line, with identical findings. For most repos, downloading the zip from GitHub now takes longer than scanning it.
 
-Scans run as background jobs, and the page shows download and scan progress while it waits.
+Scans run as background jobs. While one runs, the page shows an overall progress bar, the four steps (find the repo, download, scan, prepare results) with the current one highlighted, live detail such as MB downloaded or files scanned, and elapsed time. If a step goes quiet for a while, a note says what it's waiting on, and a dropped connection to the server is retried instead of ending the scan.
 
 `SCAN_WORKERS` (default `1`) spreads files across that many processes. Only raise it on a plan with more than one CPU; Render's free plan has a fraction of one core, so extra processes only add overhead there.
 

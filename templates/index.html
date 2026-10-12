@@ -64,12 +64,38 @@
   button.go:disabled { opacity: .6; cursor: progress; }
   .opts { grid-column: 1 / -1; color: var(--muted); font-size: .92rem; display: flex; gap: 8px; align-items: center; }
 
-  .status { margin-top: 28px; color: var(--muted); }
-  .status p { margin: 0 0 10px; font-variant-numeric: tabular-nums; }
-  progress { width: 100%; height: 10px; appearance: none; border: 0; border-radius: 5px; background: var(--rule); overflow: hidden; }
-  progress::-webkit-progress-bar { background: var(--rule); }
-  progress::-webkit-progress-value { background: var(--action); }
-  progress::-moz-progress-bar { background: var(--action); }
+  /* Scan progress */
+  .run { margin-top: 32px; padding: 20px 20px 18px; background: var(--panel); border-radius: 6px; }
+  .run-head { display: flex; align-items: baseline; gap: 12px; margin-bottom: 12px; }
+  .run-head strong { font-size: 1.1rem; font-weight: 600; }
+  .run-head .elapsed { margin-left: auto; color: var(--muted); font-size: .9rem; font-variant-numeric: tabular-nums; }
+  .bar { position: relative; height: 12px; border-radius: 6px; background: var(--rule); overflow: hidden; }
+  .bar .fill { position: absolute; inset: 0 auto 0 0; width: 0; background: var(--action); border-radius: 6px; transition: width .6s ease-out; }
+  /* A light band sweeps across the filled part while the scan runs, so the
+     bar visibly moves even during a step that reports no numbers. */
+  .bar .fill::after {
+    content: ""; position: absolute; inset: 0;
+    background: linear-gradient(90deg, transparent, rgba(255,255,255,.45), transparent) no-repeat;
+    background-size: 40% 100%;
+    animation: sweep 1.6s linear infinite;
+  }
+  .run.finished .bar .fill::after { animation: none; display: none; }
+  @keyframes sweep { from { background-position: -60% 0; } to { background-position: 160% 0; } }
+  .detail { margin: 10px 0 0; color: var(--muted); font-size: .94rem; font-variant-numeric: tabular-nums; min-height: 1.5em; overflow-wrap: anywhere; }
+  .steps { list-style: none; margin: 16px 0 0; padding: 14px 0 0; border-top: 1px solid var(--rule);
+           display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px 12px; counter-reset: step; }
+  .steps li { counter-increment: step; font-size: .9rem; color: var(--muted); display: flex; gap: 8px; align-items: center; }
+  .steps li::before {
+    content: counter(step); flex: none; width: 1.6em; height: 1.6em; border-radius: 50%;
+    display: inline-grid; place-items: center; font-size: .78rem; font-weight: 600;
+    border: 1.5px solid var(--rule); color: var(--muted);
+  }
+  .steps li.done { color: var(--ink); }
+  .steps li.done::before { content: "\2713"; background: var(--action); border-color: var(--action); color: var(--action-ink); }
+  .steps li.now { color: var(--ink); font-weight: 600; }
+  .steps li.now::before { border-color: var(--action); color: var(--action); }
+  .slow { margin: 12px 0 0; font-size: .9rem; color: var(--ink); padding: 8px 12px; border-left: 3px solid var(--medium); background: var(--code-bg); }
+  @media (max-width: 640px) { .steps { grid-template-columns: 1fr 1fr; } }
   .error { margin-top: 28px; padding: 14px 16px; border-left: 4px solid var(--critical); background: var(--panel); }
 
   /* Spectrum: the distribution of findings, also the filter */
@@ -135,7 +161,7 @@
     button.go { padding: 14px; }
     .f-head a { margin-left: 0; }
   }
-  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } .bar .fill::after { display: none; } }
 </style>
 </head>
 <body>
@@ -173,19 +199,141 @@ const el = (tag, props = {}, ...kids) => {
 };
 const sevColor = (s) => `var(--${s})`;
 
+const STEPS = ["Find the repo", "Download the code", "Scan source files", "Prepare results"];
+const STEP_OF = { queued: 0, looking_up: 0, downloading: 1, unpacking: 2, scanning: 2, finishing: 3, done: 3 };
+// Share of the overall bar each step covers. Downloading and scanning take
+// nearly all the time; the first and last steps are brief.
+const SPAN = [[0, 6], [6, 50], [50, 94], [94, 100]];
+// Seconds a step can go without visible change before we say so.
+const SLOW_AFTER = [8, 20, 20, 10];
+const SLOW_TEXT = [
+  "GitHub is taking a while to answer. The scanner is still waiting on it.",
+  "The download has paused for a bit. GitHub sometimes takes a while to package large repos; it usually resumes.",
+  "Still scanning. A few very large files can take longer than the rest.",
+  "Still putting the results together. Repos with many findings take a little longer.",
+];
+
+const mb = (n) => (n / 1048576).toFixed(n < 10 * 1048576 ? 1 : 0);
+const clock = (ms) => { const s = Math.round(ms / 1000); return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, "0")}s`; };
+
+function progressView(repo) {
+  const title = el("strong", { textContent: STEPS[0] });
+  const elapsed = el("span", { className: "elapsed", textContent: "0s" });
+  const fill = el("div", { className: "fill" });
+  const bar = el("div", { className: "bar", role: "progressbar", "aria-label": "Scan progress",
+    "aria-valuemin": 0, "aria-valuemax": 100, "aria-valuenow": 0 }, fill);
+  const detail = el("p", { className: "detail", textContent: `Sending ${repo} to the scanner.` });
+  const items = STEPS.map((t) => el("li", { textContent: t }));
+  const slow = el("p", { className: "slow", hidden: true });
+  const node = el("div", { className: "run" },
+    el("div", { className: "run-head" }, title, elapsed), bar, detail,
+    el("ol", { className: "steps", "aria-label": "Scan steps" }, ...items), slow);
+  // Screen readers hear step changes, not every number update.
+  const live = el("span", { className: "sr-live", "aria-live": "polite", style: "position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)" });
+  node.append(live);
+
+  const t0 = Date.now();
+  let pct = 0, step = -1, stepStart = t0, lastSig = "", lastChange = t0, measured = false;
+
+  const setPct = (p) => {
+    pct = Math.max(pct, Math.min(100, p));   // never moves backwards
+    fill.style.width = `${pct}%`;
+    bar.setAttribute("aria-valuenow", Math.round(pct));
+  };
+  const within = (k, frac) => { const [a, b] = SPAN[k]; setPct(a + (b - a) * Math.max(0, Math.min(1, frac))); };
+  const showStep = (k) => {
+    if (k <= step) return;
+    for (let i = Math.max(step, 0); i < k; i++) within(i, 1);   // fill any step we skipped past
+    step = k; stepStart = Date.now(); measured = false;
+    items.forEach((li, i) => { li.className = i < k ? "done" : i === k ? "now" : ""; });
+    title.textContent = STEPS[k];
+    live.textContent = `Step ${k + 1} of ${STEPS.length}: ${STEPS[k]}`;
+  };
+
+  const tick = setInterval(() => {
+    const now = Date.now();
+    elapsed.textContent = clock(now - t0);
+    // With no numbers for this step yet, ease toward 85% of it so the bar keeps
+    // moving without claiming the step is done.
+    if (!measured) within(step, 0.85 * (1 - Math.exp(-(now - stepStart) / 5000)));
+    if ((now - lastChange) / 1000 > SLOW_AFTER[step]) {
+      slow.hidden = false;
+      slow.textContent = SLOW_TEXT[step];
+    }
+  }, 400);
+
+  showStep(0);
+  return {
+    node,
+    update(st) {
+      showStep(STEP_OF[st.phase] ?? step);
+      switch (st.phase) {
+        case "queued":
+          detail.textContent = "Another scan is running. This one starts as soon as it finishes.";
+          break;
+        case "looking_up":
+          detail.textContent = `Asking GitHub about ${repo}.`;
+          break;
+        case "downloading": {
+          const got = st.bytes || 0, exp = st.expected || 0;
+          if (got > 0 && exp > 0) {
+            measured = true;
+            // An estimate can be off in either direction, so it never fills the step.
+            within(1, st.exact ? got / exp : Math.min(0.9, got / exp));
+          }
+          detail.textContent = !got ? "Waiting for GitHub to start sending the code."
+            : st.exact ? `${mb(got)} of ${mb(exp)} MB downloaded.`
+            : exp ? `${mb(got)} MB downloaded, of roughly ${mb(exp)} MB.`
+            : `${mb(got)} MB downloaded.`;
+          break;
+        }
+        case "unpacking":
+          detail.textContent = `Downloaded ${mb(st.bytes || 0)} MB. Picking out the source files.`;
+          break;
+        case "scanning":
+          if (st.total) {
+            measured = true;
+            within(2, st.done / st.total);
+            detail.textContent = `${st.done.toLocaleString()} of ${st.total.toLocaleString()} files` +
+              (st.current ? `, last finished ${st.current}` : "") + ".";
+          } else {
+            detail.textContent = "This repo has no files in a language the scanner covers.";
+          }
+          break;
+        case "finishing":
+          detail.textContent = `Sorting ${Number(st.findings || 0).toLocaleString()} findings.`;
+          break;
+        case "done":
+          setPct(100);
+          items.forEach((li) => { li.className = "done"; });
+          title.textContent = "Scan complete";
+          detail.textContent = "Showing results.";
+          live.textContent = "Scan complete.";
+          node.classList.add("finished");
+          break;
+      }
+      const sig = JSON.stringify([st.phase, st.bytes, st.done]);
+      if (sig !== lastSig) { lastSig = sig; lastChange = Date.now(); slow.hidden = true; }
+    },
+    connectionTrouble() {
+      slow.hidden = false;
+      slow.textContent = "Lost touch with the server for a moment. Reconnecting; the scan keeps running.";
+    },
+    stop() { clearInterval(tick); node.classList.add("finished"); },
+  };
+}
+
 $("#form").addEventListener("submit", async (e) => {
   e.preventDefault();
   const repo = $("#repo").value.trim();
   const out = $("#out");
   $("#go").disabled = true; $("#go").textContent = "Scanning…";
-  const msg = el("p", { textContent: `Starting a scan of ${repo}.` });
-  const meter = el("progress", { max: 1 });
-  meter.removeAttribute("value");   // indeterminate until we know the file count
-  out.replaceChildren(el("div", { className: "status" }, msg, meter));
+  const run = progressView(repo);
+  out.replaceChildren(run.node);
   const call = async (url, opts) => {
     const r = await fetch(url, opts);
     const body = await r.json().catch(() => ({ error: "The server sent back something unexpected." }));
-    if (!r.ok || body.error) throw new Error(body.error || `Scan failed (${r.status}).`);
+    if (!r.ok || body.error) throw Object.assign(new Error(body.error || `Scan failed (${r.status}).`), { status: r.status });
     return body;
   };
   try {
@@ -193,23 +341,29 @@ $("#form").addEventListener("submit", async (e) => {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ repo, include_tests: $("#tests").checked }),
     });
-    let st;
+    let st, misses = 0;
     for (;;) {
       await new Promise((res) => setTimeout(res, 700));
-      st = await call(`/api/scan/${job}`);
-      if (st.phase === "done") break;
-      if (st.phase === "downloading") {
-        msg.textContent = `Downloading ${repo} from GitHub: ${((st.bytes || 0) / 1048576).toFixed(1)} MB so far.`;
-      } else if (st.phase === "scanning" && st.total) {
-        msg.textContent = `Scanning source files: ${st.done.toLocaleString()} of ${st.total.toLocaleString()}.`;
-        meter.max = st.total; meter.value = st.done;
-      } else if (st.phase === "queued") {
-        msg.textContent = `Waiting to start the scan of ${repo}.`;
+      try {
+        st = await call(`/api/scan/${job}`);
+        misses = 0;
+      } catch (err) {
+        // One dropped poll (flaky network, a hiccup on the server) shouldn't
+        // end the scan; give up after several in a row or a real "not found".
+        if (err.status === 404 || err.status === 400 || ++misses >= 6) throw err;
+        run.connectionTrouble();
+        continue;
       }
+      if (st.phase === "error") throw new Error(st.error);
+      run.update(st);
+      if (st.phase === "done") break;
     }
+    run.stop();
+    await new Promise((res) => setTimeout(res, 350));   // let the bar visibly reach the end
     data = st.result; data.elapsed = st.elapsed; active = new Set(SEVS); shown = PAGE;
     render();
   } catch (err) {
+    run.stop();
     out.replaceChildren(el("div", { className: "error", textContent: err.message }));
   } finally {
     $("#go").disabled = false; $("#go").textContent = "Scan repo";
